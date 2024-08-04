@@ -63,23 +63,28 @@ class VolterraNet(nn.Module):
         return out
 
 if __name__ == "__main__":
-    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
 
     transform = transforms.Compose([
-        transforms.Resize((320, 180)),
+        transforms.Resize((180, 320)),
         transforms.ToTensor()
     ])
 
-    dataset = PairedImageDataset(
+    train_dataset = PairedImageDataset(
         degraded_dir='train/degraded', 
         clean_dir='train/clean', 
         transform=transform, 
         augment=True
     )
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2)
+    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2)
 
+    val_dataset = PairedImageDataset(
+        degraded_dir='val/degraded', 
+        clean_dir='val/clean', 
+        transform=transform
+    )
+    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=8, pin_memory=True)
 
     model = VolterraNet(num_channels=3)
     model.to(device)
@@ -93,26 +98,55 @@ if __name__ == "__main__":
     epochs_without_improvement = 0
 
     scaler = GradScaler()
+    accumulation_steps = 4
 
-    num_epochs = 100
+    num_epochs = 50
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for degraded_images, clean_images in dataloader:
+        for degraded_images, clean_images in train_dataloader:
             degraded_images, clean_images = degraded_images.to(device), clean_images.to(device)
 
             optimizer.zero_grad()
             with autocast(device_type='cuda'):
                 restored_images = model(degraded_images)
                 loss = criterion(restored_images, clean_images)
+                loss = loss / accumulation_steps
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            optimizer.zero_grad()
             
             running_loss += loss.item()
         
-        average_loss = running_loss / len(dataloader)
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {average_loss:.4f}')
+        average_loss = running_loss / len(train_dataloader)
+        print(f'Epoch [{epoch+1}/{num_epochs}], Training Loss: {average_loss:.4f}')
 
-        torch.save(model.state_dict(), 'best_volterra_net.pth')
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for val_degraded_images, val_clean_images in val_dataloader:
+                val_degraded_images, val_clean_images = val_degraded_images.to(device), val_clean_images.to(device)
+                with autocast(device_type='cuda'):
+                    val_restored_images = model(val_degraded_images)
+                    val_loss += criterion(val_restored_images, val_clean_images).item()
+        
+        average_val_loss = val_loss / len(val_dataloader)
+        print(f'Epoch [{epoch+1}/{num_epochs}], Validation Loss: {average_val_loss:.4f}')
+
+        scheduler.step(average_val_loss)
+
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f'Current learning rate: {current_lr}')
+
+        if average_val_loss < best_loss:
+            best_loss = average_val_loss
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), 'best_volterra_net.pth')
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                torch.save(model.state_dict(), 'best_volterra_net.pth')
+                print("Early stopping triggered")
+                break
