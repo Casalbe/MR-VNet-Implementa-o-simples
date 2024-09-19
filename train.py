@@ -1,13 +1,15 @@
 import os
-from PIL import Image
 import torch
+from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import GradScaler, autocast
 from torchvision.transforms import functional as TF
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+import lpips
 
 class PairedImageDataset(Dataset):
     def __init__(self, degraded_dir, clean_dir, transform=None, augment=False):
@@ -49,18 +51,38 @@ class VolterraNet(nn.Module):
         self.num_channels = num_channels
         
         self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(num_channels)
+        
         self.conv2_1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
         self.conv2_2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn2_1 = nn.BatchNorm2d(num_channels)
+        self.bn2_2 = nn.BatchNorm2d(num_channels)
+        
         self.conv3_1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
         self.conv3_2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
         self.conv3_3 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn3_1 = nn.BatchNorm2d(num_channels)
+        self.bn3_2 = nn.BatchNorm2d(num_channels)
+        self.bn3_3 = nn.BatchNorm2d(num_channels)
         
     def forward(self, x):
-        linear_term = self.conv1(x)
-        quad_term = self.conv2_1(x) * self.conv2_2(x)
-        cubic_term = self.conv3_1(x) * self.conv3_2(x) * self.conv3_3(x)
+        linear_term = self.bn1(self.conv1(x))
+        
+        quad_term = torch.mul(self.bn2_1(self.conv2_1(x)), self.bn2_2(self.conv2_2(x))).clamp(min=0)
+        
+        cubic_term = torch.mul(self.bn3_1(self.conv3_1(x)), 
+                               torch.mul(self.bn3_2(self.conv3_2(x)), self.bn3_3(self.conv3_3(x)))).clamp(min=0)
+        
         out = linear_term + quad_term + cubic_term
         return out
+
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self):
+        super(VGGPerceptualLoss, self).__init__()
+        self.lpips = lpips.LPIPS(net='vgg').to('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    def forward(self, restored_image, clean_image):
+        return self.lpips(restored_image, clean_image)
 
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -70,7 +92,7 @@ if __name__ == "__main__":
         transforms.Resize((180, 320)),
         transforms.ToTensor()
     ])
-
+    
     train_dataset = PairedImageDataset(
         degraded_dir='train/degraded', 
         clean_dir='train/clean', 
@@ -90,33 +112,44 @@ if __name__ == "__main__":
     model.to(device)
 
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    vgg_loss = VGGPerceptualLoss()
 
-    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
-    patience = 10
-    best_loss = float('inf')
-    epochs_without_improvement = 0
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = CosineAnnealingLR(optimizer, T_max=10)
+
+    psnr_metric = PeakSignalNoiseRatio().to(device)
+    ssim_metric = StructuralSimilarityIndexMeasure().to(device)
+    
+    lpips_metric = lpips.LPIPS(net='vgg').to(device)
 
     scaler = GradScaler()
     accumulation_steps = 4
 
     num_epochs = 50
+    best_loss = float('inf')
+    patience = 10
+    epochs_without_improvement = 0
+
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for degraded_images, clean_images in train_dataloader:
+        for i, (degraded_images, clean_images) in enumerate(train_dataloader):
             degraded_images, clean_images = degraded_images.to(device), clean_images.to(device)
 
             optimizer.zero_grad()
             with autocast(device_type='cuda'):
                 restored_images = model(degraded_images)
-                loss = criterion(restored_images, clean_images)
-                loss = loss / accumulation_steps
+                mse_loss = criterion(restored_images, clean_images)
+                perceptual_loss = vgg_loss(restored_images, clean_images)
+                
+                loss = (mse_loss + perceptual_loss).mean() / accumulation_steps
 
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
+
+            if (i + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             
             running_loss += loss.item()
         
@@ -125,17 +158,28 @@ if __name__ == "__main__":
 
         model.eval()
         val_loss = 0.0
+        psnr_total = 0.0
+        ssim_total = 0.0
+        lpips_total = 0.0
         with torch.no_grad():
             for val_degraded_images, val_clean_images in val_dataloader:
                 val_degraded_images, val_clean_images = val_degraded_images.to(device), val_clean_images.to(device)
                 with autocast(device_type='cuda'):
                     val_restored_images = model(val_degraded_images)
                     val_loss += criterion(val_restored_images, val_clean_images).item()
-        
-        average_val_loss = val_loss / len(val_dataloader)
-        print(f'Epoch [{epoch+1}/{num_epochs}], Validation Loss: {average_val_loss:.4f}')
+                    psnr_total += psnr_metric(val_restored_images, val_clean_images)
+                    ssim_total += ssim_metric(val_restored_images, val_clean_images)
+                    lpips_total += lpips_metric(val_restored_images, val_clean_images).mean()
 
-        scheduler.step(average_val_loss)
+        average_val_loss = val_loss / len(val_dataloader)
+        average_psnr = psnr_total / len(val_dataloader)
+        average_ssim = ssim_total / len(val_dataloader)
+        average_lpips = lpips_total / len(val_dataloader)
+
+        print(f'Epoch [{epoch+1}/{num_epochs}], Validation Loss: {average_val_loss:.4f}')
+        print(f'Epoch [{epoch+1}/{num_epochs}], PSNR: {average_psnr:.4f} dB, SSIM: {average_ssim:.4f}, LPIPS: {average_lpips:.4f}')
+
+        scheduler.step()
 
         current_lr = optimizer.param_groups[0]['lr']
         print(f'Current learning rate: {current_lr}')
@@ -147,6 +191,5 @@ if __name__ == "__main__":
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
-                torch.save(model.state_dict(), 'best_volterra_net.pth')
-                print("Early stopping triggered")
+                print("Early stopping triggered.")
                 break
