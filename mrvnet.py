@@ -11,16 +11,28 @@ class VolterraNet(nn.Module):
         self.num_channels = num_channels
         
         self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(num_channels)
+        
         self.conv2_1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
         self.conv2_2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn2_1 = nn.BatchNorm2d(num_channels)
+        self.bn2_2 = nn.BatchNorm2d(num_channels)
+        
         self.conv3_1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
         self.conv3_2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
         self.conv3_3 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn3_1 = nn.BatchNorm2d(num_channels)
+        self.bn3_2 = nn.BatchNorm2d(num_channels)
+        self.bn3_3 = nn.BatchNorm2d(num_channels)
         
     def forward(self, x):
-        linear_term = self.conv1(x)
-        quad_term = self.conv2_1(x) * self.conv2_2(x)
-        cubic_term = self.conv3_1(x) * self.conv3_2(x) * self.conv3_3(x)
+        linear_term = self.bn1(self.conv1(x))
+        
+        quad_term = torch.mul(self.bn2_1(self.conv2_1(x)), self.bn2_2(self.conv2_2(x))).clamp(min=0)
+        
+        cubic_term = torch.mul(self.bn3_1(self.conv3_1(x)), 
+                               torch.mul(self.bn3_2(self.conv3_2(x)), self.bn3_3(self.conv3_3(x)))).clamp(min=0)
+        
         out = linear_term + quad_term + cubic_term
         return out
 
@@ -39,12 +51,12 @@ def save_image(tensor, path):
     image.save(path)
 
 model = VolterraNet(num_channels=3)
-model.load_state_dict(torch.load('best_volterra_net.pth'))
+model.load_state_dict(torch.load('backup/best_volterra_net.pth'))
 
 model.eval()
 
-degraded_image_path = '3.jpg'
-restored_image_path = 'deblurtest.jpg'
+degraded_image_path = 'image.jpg'
+restored_image_path = 'deblured.jpg'
 
 degraded_image = load_image(degraded_image_path)
 
@@ -59,12 +71,12 @@ restored_image_disp = Image.open(restored_image_path)
 plt.figure(figsize=(10, 5))
 
 plt.subplot(1, 2, 1)
-plt.title("Degraded Image")
+plt.title("Imagem degradada")
 plt.imshow(original_image)
 plt.axis("off")
 
 plt.subplot(1, 2, 2)
-plt.title("Restored Image")
+plt.title("Imagem restaurada")
 plt.imshow(restored_image_disp)
 plt.axis("off")
 
